@@ -141,10 +141,11 @@ pub fn open_concrete(
                 continue;
             }
         };
-        // Read the full payload.
-        let body = read_body(&mut *input, header.data_size)?;
-        // Trailing PreviousTagSize (u32 BE).
-        let _ = read_u32_be(&mut *input)?;
+        // Read the payload (all of it, or what a cut file has left).
+        let (body, _) = read_body(&mut *input, header.data_size)?;
+        // Trailing PreviousTagSize (u32 BE); reads as 0 past the end, as
+        // FFmpeg's avio_rb32 does.
+        let _ = read_u32_be(&mut *input);
 
         match kind {
             TagType::ScriptData => {
@@ -540,9 +541,16 @@ impl Demuxer for FlvDemuxer {
                 Err(Error::Eof) => return Err(Error::Eof),
                 Err(e) => return Err(e),
             };
-            let body = read_body(&mut *self.input, header.data_size)?;
-            // Trailing PreviousTagSize.
-            let _ = read_u32_be(&mut *self.input)?;
+            let (body, cut) = read_body(&mut *self.input, header.data_size)?;
+            // Trailing PreviousTagSize; reads as 0 past the end, as FFmpeg's
+            // avio_rb32 does.
+            let _ = read_u32_be(&mut *self.input);
+            // A tag cut by the end of the file is handed over flagged
+            // corrupt, as av_get_packet flags it.
+            let mark = |mut p: Packet| {
+                p.flags.corrupt |= cut;
+                p
+            };
 
             // Filtered (encrypted) tags carry an EncryptionTagHeader +
             // FilterParams preamble in front of the codec body. Per F.1
@@ -559,7 +567,7 @@ impl Demuxer for FlvDemuxer {
                     self.video_stream_index,
                     &self.streams,
                 )? {
-                    return Ok(pkt);
+                    return Ok(mark(pkt));
                 }
                 continue;
             }
@@ -596,6 +604,7 @@ impl Demuxer for FlvDemuxer {
                     }
                     if let Some((pkt, pending)) =
                         build_audio_packet(&self.streams[idx as usize], &header, &body)
+                            .map(|(p, q)| (mark(p), q.map(mark)))
                     {
                         // Capture all tracks of a multitrack tag (or clear
                         // the side-channel for a single-track tag) for
@@ -632,6 +641,7 @@ impl Demuxer for FlvDemuxer {
                     }
                     if let Some((pkt, pending)) =
                         build_video_packet(&self.streams[idx as usize], &header, &body)
+                            .map(|(p, q)| (mark(p), q.map(mark)))
                     {
                         // Capture all tracks of a multitrack tag (or clear
                         // the side-channel for a single-track tag) for
@@ -2120,39 +2130,46 @@ fn read_u32_be<R: Read + ?Sized>(r: &mut R) -> Result<u32> {
     Ok(u32::from_be_bytes(b))
 }
 
-/// Read a tag payload of `size` bytes, with a pre-allocation safety
-/// check against the remaining length of the underlying stream.
+/// Read a tag payload of `size` bytes as FFmpeg's `av_get_packet` does: a
+/// tag cut by the end of the input yields what is left, and the `bool` says
+/// it was cut (the packet goes out flagged corrupt); nothing left at all
+/// ends the stream.
 ///
 /// The FLV `DataSize` field is a UI24 (max 16 777 215). A forged tag
 /// header on a small file (e.g. `data_size = 0xFFFFFF` on a 30-byte
-/// input) would otherwise cause [`Vec::with_capacity`] to commit ~16 MB
-/// before [`Read::read_exact`] fails with `UnexpectedEof`. We probe the
-/// stream's total length once and reject any `data_size` that exceeds
-/// "bytes remaining from current position" — that turns the OOM vector
-/// into an [`Error::InvalidData`] **before** any allocation occurs.
+/// input) would otherwise commit ~16 MB up front. We probe the stream's
+/// total length once and allocate no more than the bytes remaining from
+/// the current position.
 ///
 /// The probe uses [`Seek::stream_position`] + [`Seek::seek(End)`] +
 /// `seek(Start)` rather than `Seek::stream_len` (still unstable). On
 /// streams that don't support seeking-to-end (none of our inputs in
 /// practice — every container demuxer takes `Box<dyn ReadSeek>`) the
-/// probe falls back to "trust the size and let `read_exact` error".
-fn read_body<R: Read + Seek + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
-    let needed = size as u64;
+/// size is trusted and the read stops where the input does.
+fn read_body<R: Read + Seek + ?Sized>(r: &mut R, size: u32) -> Result<(Vec<u8>, bool)> {
+    let mut want = u64::from(size);
     if let Ok(cur) = r.stream_position() {
         if let Ok(end) = r.seek(SeekFrom::End(0)) {
-            // Restore the cursor before erroring or reading.
+            // Restore the cursor before reading.
             r.seek(SeekFrom::Start(cur))?;
-            let remaining = end.saturating_sub(cur);
-            if needed > remaining {
-                return Err(Error::invalid(format!(
-                    "FLV tag: DataSize {needed} exceeds remaining stream bytes {remaining}"
-                )));
-            }
+            want = want.min(end.saturating_sub(cur));
         }
     }
-    let mut out = vec![0u8; size as usize];
-    r.read_exact(&mut out)?;
-    Ok(out)
+    let mut out = vec![0u8; want as usize];
+    let mut n = 0;
+    while n < out.len() {
+        match r.read(&mut out[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if n == 0 && size > 0 {
+        return Err(Error::Eof);
+    }
+    out.truncate(n);
+    Ok((out, n < size as usize))
 }
 
 fn skip_bytes<R: Seek + ?Sized>(r: &mut R, n: u64) -> Result<()> {
@@ -2249,6 +2266,34 @@ mod tests {
         assert!(p2.flags.keyframe);
         assert_eq!(p2.data, vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
 
+        assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    }
+
+    /// A file cut inside its last tag (FATE flv/Enigma_Principles_of_Lust-
+    /// part.flv): FFmpeg's `av_get_packet` hands over what is left, flagged
+    /// corrupt, the missing PreviousTagSize reads as 0, and the stream then
+    /// ends. It is not a demux error.
+    #[test]
+    fn a_tag_cut_by_the_end_of_the_file_is_handed_over_short_and_corrupt() {
+        let mp3_body = vec![(2 << 4) | (2 << 2) | 0x02 | 0x01, 0xAA, 0xBB, 0xCC];
+        let key = vec![(1 << 4) | 4, 0x00, 0xDE, 0xAD];
+        let cut = vec![(2 << 4) | 4, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mut flv = make_flv(&[
+            &make_tag(0x08, 0, &mp3_body),
+            &make_tag(0x09, 33, &key),
+            &make_tag(0x09, 66, &cut),
+        ]);
+        // Lose the trailing PreviousTagSize and the last 4 body bytes.
+        flv.truncate(flv.len() - 4 - 4);
+
+        let mut dmx = open(Box::new(Cursor::new(flv)), &NullCodecResolver).unwrap();
+        for _ in 0..2 {
+            assert!(!dmx.next_packet().unwrap().flags.corrupt);
+        }
+        let last = dmx.next_packet().unwrap();
+        assert_eq!((last.stream_index, last.pts), (1, Some(66)));
+        assert_eq!(last.data, vec![0x00, 0x11, 0x22]);
+        assert!(last.flags.corrupt);
         assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
     }
 

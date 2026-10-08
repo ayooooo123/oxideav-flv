@@ -22,7 +22,7 @@
 
 use std::io::Cursor;
 
-use oxideav_core::{Error, NullCodecResolver, ReadSeek};
+use oxideav_core::{Error, NullCodecResolver, Packet, ReadSeek};
 use oxideav_flv::open_demuxer;
 
 // ---- blob builders --------------------------------------------------------
@@ -84,26 +84,50 @@ fn wrap_no_trailer(tag_bytes: &[u8]) -> Vec<u8> {
 /// error. Returns the count of packets that came out cleanly plus the
 /// terminal `Result`. Never panics — that's the contract under test.
 fn drain(bytes: Vec<u8>) -> (usize, Result<(), Error>) {
+    let (packets, r) = drain_packets(bytes);
+    (packets.len(), r)
+}
+
+/// [`drain`], keeping every packet.
+fn drain_packets(bytes: Vec<u8>) -> (Vec<Packet>, Result<(), Error>) {
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx = match open_demuxer(input, &NullCodecResolver) {
         Ok(d) => d,
-        Err(e) => return (0, Err(e)),
+        Err(e) => return (Vec::new(), Err(e)),
     };
-    let mut count = 0usize;
+    let mut packets = Vec::new();
     loop {
         match dmx.next_packet() {
-            Ok(_) => {
-                count += 1;
+            Ok(p) => {
+                packets.push(p);
                 // Hard cap so a hypothetical infinite-loop regression
                 // doesn't wedge the test runner.
-                if count > 10_000 {
-                    return (count, Err(Error::invalid("packet flood")));
+                if packets.len() > 10_000 {
+                    return (packets, Err(Error::invalid("packet flood")));
                 }
             }
-            Err(Error::Eof) => return (count, Ok(())),
-            Err(e) => return (count, Err(e)),
+            Err(Error::Eof) => return (packets, Ok(())),
+            Err(e) => return (packets, Err(e)),
         }
     }
+}
+
+/// A tag cut by the end of the input comes out as FFmpeg's
+/// `av_get_packet` gives it: what is left, flagged corrupt, never more
+/// than the input holds (the 16 MB a forged `DataSize` claims is never
+/// allocated), and the stream then ends.
+fn assert_cut_tag_handed_over(bytes: Vec<u8>, what: &str) -> Vec<Packet> {
+    let len = bytes.len();
+    let (packets, r) = drain_packets(bytes);
+    assert!(
+        matches!(r, Ok(())),
+        "{what}: the stream ends cleanly, got {r:?}"
+    );
+    assert!(
+        packets.iter().all(|p| p.data.len() <= len),
+        "{what}: a packet larger than the input"
+    );
+    packets
 }
 
 // ---- header / preamble injection -----------------------------------------
@@ -143,60 +167,53 @@ fn bad_signature_errors_cleanly() {
 // ---- DataSize injection (the OOM lever) ----------------------------------
 
 #[test]
-fn forged_oversize_data_size_rejected_before_alloc() {
+fn forged_oversize_data_size_reads_only_what_is_there() {
     // Forge a tag header that claims 16 MB of payload but the file is
-    // 30 bytes. The pre-allocation guard in `read_body` must reject
-    // *before* committing a 16 MB Vec.
+    // 30 bytes: the read is bounded by the bytes remaining, so no 16 MB
+    // Vec is committed, and the short payload goes out corrupt.
     let forged = tag_with_forged_size(0x09, 0, &[0x12], 0x00FF_FFFF);
-    let bytes = wrap(&forged);
-    let (_, r) = drain(bytes);
+    let packets = assert_cut_tag_handed_over(wrap(&forged), "forged oversize");
     assert!(
-        matches!(r, Err(Error::InvalidData(_)) | Err(Error::Io(_))),
-        "forged-oversize tag must error, got {r:?}"
+        packets.last().is_some_and(|p| p.flags.corrupt),
+        "the cut tag is flagged corrupt"
     );
 }
 
 #[test]
-fn forged_oversize_audio_tag_first_position_rejected() {
-    // Same lever, but on the first tag (so the *open()* path is the
-    // one that has to refuse — discovery, not next_packet()).
+fn forged_oversize_audio_tag_first_position_reads_only_what_is_there() {
+    // Same lever, but on the first tag (so the *open()* path reads it
+    // too — discovery, not only next_packet()).
     let forged = tag_with_forged_size(0x08, 0, &[0xAF], 0x00FF_FFFF);
-    let bytes = wrap(&forged);
-    let (_, r) = drain(bytes);
-    assert!(
-        matches!(r, Err(Error::InvalidData(_)) | Err(Error::Io(_))),
-        "forged-oversize first-tag must abort open() cleanly, got {r:?}"
-    );
+    assert_cut_tag_handed_over(wrap(&forged), "forged oversize first tag");
 }
 
 #[test]
-fn data_size_one_byte_past_eof_rejected() {
-    // Body is one byte short of the claimed size — guard must fire
-    // because remaining = body.len(), but DataSize = body.len() + 1.
+fn data_size_one_byte_past_eof_yields_a_short_corrupt_packet() {
+    // Body is one byte short of the claimed size, with no trailer: the
+    // three bytes there go out (VP6: adjustment byte + data), corrupt.
     let body = [0x14u8, 0x00, 0x42];
     let forged = tag_with_forged_size(0x09, 0, &body, body.len() as u32 + 1);
-    let bytes = wrap_no_trailer(&forged); // no trailer → minimum stream length
-    let (_, r) = drain(bytes);
-    assert!(
-        matches!(r, Err(Error::InvalidData(_)) | Err(Error::Io(_))),
-        "off-by-one truncation must error, got {r:?}"
-    );
+    let packets = assert_cut_tag_handed_over(wrap_no_trailer(&forged), "one byte past the end");
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].data, vec![0x00, 0x42]);
+    assert!(packets[0].flags.corrupt);
 }
 
 // ---- truncated trailer ----------------------------------------------------
 
 #[test]
-fn truncated_previous_tag_size_errors_cleanly() {
+fn a_missing_last_previous_tag_size_ends_the_stream() {
     // Valid tag, valid body, but the trailing 4-byte `PreviousTagSize`
-    // is missing. `read_u32_be` on the trailer must surface
-    // `UnexpectedEof` (mapped to `Error::Io`), not panic.
+    // is missing: it reads as 0 at the end (FFmpeg's avio_rb32), the
+    // packet is whole, and the stream ends.
     let body = [0x14u8, 0x00, 0x42];
     let tag = tag_with_forged_size(0x09, 0, &body, body.len() as u32);
     let mut bytes = flv_preamble(0x05);
     bytes.extend_from_slice(&tag);
     // intentionally no trailer
-    let (_, r) = drain(bytes);
-    assert!(r.is_err(), "missing trailer must error cleanly");
+    let packets = assert_cut_tag_handed_over(bytes, "missing trailer");
+    assert_eq!(packets.len(), 1);
+    assert!(!packets[0].flags.corrupt);
 }
 
 // ---- malformed script data ------------------------------------------------
@@ -328,7 +345,7 @@ fn zero_length_audio_tag_is_skipped_not_panic() {
 // ---- mid-stream truncation -----------------------------------------------
 
 #[test]
-fn mid_tag_truncation_after_discovery_errors_cleanly() {
+fn mid_tag_truncation_after_discovery_yields_a_short_corrupt_packet() {
     // Build a file with two valid tags + a third whose 11-byte header
     // is fully present but whose body is truncated to one byte.
     let audio = tag_with_forged_size(0x08, 0, &[0x2F, 0x00, 0x00], 3);
@@ -342,8 +359,13 @@ fn mid_tag_truncation_after_discovery_errors_cleanly() {
     bytes.extend_from_slice(&(video.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&forged_third);
     // no trailer — body itself is already truncated
-    let (_count, r) = drain(bytes);
-    assert!(r.is_err(), "mid-stream truncation must error on read");
+    let packets = assert_cut_tag_handed_over(bytes, "mid-stream truncation");
+    assert!(packets.len() >= 2, "the two whole tags come out");
+    assert!(packets[..2].iter().all(|p| !p.flags.corrupt));
+    assert!(
+        packets[2..].iter().all(|p| p.flags.corrupt),
+        "the cut tag is flagged corrupt"
+    );
 }
 
 // ---- repeated tags-with-zero-size do not loop forever ---------------------
